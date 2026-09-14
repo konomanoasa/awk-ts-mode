@@ -1,6 +1,6 @@
-# awk-posix-ts-mode
+# awk-ts-mode
 
-[![CI](https://github.com/konomanoasa/awk-posix-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/konomanoasa/awk-posix-ts-mode/actions/workflows/ci.yml)
+[![CI](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yml)
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
 [Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 `awk`.
@@ -12,7 +12,7 @@
 ## Installation
 
 ```elisp
-(package-vc-install "https://github.com/konomanoasa/awk-posix-ts-mode")
+(package-vc-install "https://github.com/konomanoasa/awk-ts-mode")
 ```
 
 ## Automatic Activation

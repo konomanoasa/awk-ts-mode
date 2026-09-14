@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -37,7 +38,8 @@ jobs:
             | shasum -a 256 --check
           tar -xf "$archive" -C "$source_directory" --strip-components=1
           cd "$source_directory"
-          export PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
+          PKG_CONFIG_PATH="$(brew --prefix tree-sitter)/lib/pkgconfig:$(brew --prefix gnutls)/lib/pkgconfig"
+          export PKG_CONFIG_PATH
           ./configure \
             --prefix="$HOME/.local/emacs-31.1" \
             --without-dbus \
@@ -66,20 +68,20 @@ jobs:
             -l package-lint \
             --eval '(setq package-lint-emacs-head-version (quote (32)))' \
             -f package-lint-batch-and-exit \
-            awk-posix-ts-mode.el
+            awk-ts-mode.el
           "$emacs" -Q --batch \
             -l checkdoc \
-            --eval '(find-file "awk-posix-ts-mode.el")' \
+            --eval '(find-file "awk-ts-mode.el")' \
             -f checkdoc-batch
           "$emacs" -Q --batch -L . \
             --eval '(progn (require (quote bytecomp)) (setq byte-compile-error-on-warn t))' \
             -f batch-byte-compile \
-            awk-posix-ts-mode.el
+            awk-ts-mode.el
           "$emacs" -Q --batch -L . \
             --eval "(setq user-emacs-directory \"$RUNNER_TEMP/emacs.d/\")" \
-            -l awk-posix-ts-mode \
-            --eval '(let ((treesit-auto-install-grammar (quote always))) (dolist (language (quote (posix-awk))) (unless (awk-posix-ts-mode--ensure-grammar language) (error "Cannot install the %s grammar" language))))'
+            -l awk-ts-mode \
+            --eval '(let ((treesit-auto-install-grammar (quote always))) (dolist (language (quote (posix-awk))) (unless (awk-ts-mode--ensure-grammar language) (error "Cannot install the %s grammar" language))))'
           "$emacs" -Q --batch -L . -L test \
             --eval "(setq user-emacs-directory \"$RUNNER_TEMP/emacs.d/\")" \
-            -l test/awk-posix-ts-mode-test.el \
+            -l test/awk-ts-mode-test.el \
             -f ert-run-tests-batch-and-exit
