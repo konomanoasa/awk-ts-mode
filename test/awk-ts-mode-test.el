@@ -135,7 +135,7 @@
    (equal
     (awk-ts-mode-test--grammar-source nil)
     '(posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-                :revision "v0.14.0"))))
+                :revision "v0.15.0"))))
 
 (ert-deftest awk-ts-mode-preserves-a-user-grammar-source ()
   (let ((custom '(posix-awk . ("custom-source"))))
@@ -381,6 +381,37 @@
       (should (eq (get-text-property (- (point) 2) 'face)
                   'font-lock-punctuation-face))
       (should-not (get-text-property (1- (point)) 'face)))))
+
+(ert-deftest awk-ts-mode-preserves-function-roles-after-parameter-newline-edits ()
+  (awk-ts-mode-test--require-grammar)
+  (dolist (header '("function total(" "function total ("))
+    (with-temp-buffer
+      (awk-ts-mode-test--fontify
+       4 (list (concat header "first, second) { return first }")))
+      (dolist (gap '("\n" " # note\n\n" " "))
+        (goto-char (point-min))
+        (search-forward ",")
+        (let ((start (point)))
+          (search-forward "second")
+          (delete-region start (- (point) (length "second")))
+          (goto-char start)
+          (insert gap))
+        (font-lock-flush)
+        (font-lock-ensure)
+        (should-not (treesit-node-check (treesit-buffer-root-node 'posix-awk)
+                                        'has-error))
+        (goto-char (point-min))
+        (awk-ts-mode-test--should-have-next-faces
+         '(("total" font-lock-function-name-face)
+           ("first" font-lock-variable-name-face)
+           ("," font-lock-punctuation-face)
+           ("second" font-lock-variable-name-face)
+           ("first" font-lock-variable-use-face)))
+        (should (equal (mapcar #'car
+                               (cdr (assoc "Function"
+                                           (funcall imenu-create-index-function))))
+                       '("total")))
+        (awk-ts-mode-test--should-match-fresh-buffer 4)))))
 
 (ert-deftest awk-ts-mode-reclassifies-calls-after-continuation-edits ()
   (awk-ts-mode-test--require-grammar)

@@ -42,7 +42,7 @@
 
 (defconst awk-ts-mode--grammar-sources
   '((posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-               :revision "v0.14.0"))
+               :revision "v0.15.0"))
   "Tree-sitter grammar sources for POSIX awk.")
 
 ;;;; Context
