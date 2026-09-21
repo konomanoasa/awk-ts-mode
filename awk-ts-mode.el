@@ -42,13 +42,13 @@
 
 (defconst awk-ts-mode--grammar-sources
   '((posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-               :revision "v0.15.0"))
+               :revision "v0.16.0"))
   "Tree-sitter grammar sources for POSIX awk.")
 
 ;;;; Context
 
 (defun awk-ts-mode--ancestor-p (node type)
-  "Return non-nil when NODE has an ancestor of TYPE."
+  "Return non-nil when NODE or an ancestor has TYPE."
   (let (found)
     (while (and node (not found))
       (when (equal (treesit-node-type node) type)
@@ -77,26 +77,20 @@
     table)
   "Syntax table for `awk-ts-mode'.")
 
-(defvar awk-ts-mode-syntax--query-cache nil
-  "Cached syntax query.")
-
 ;;;;; Syntax Queries
 
-(defun awk-ts-mode-syntax--query ()
-  "Return the cached syntax query."
-  (or awk-ts-mode-syntax--query-cache
-      (setq awk-ts-mode-syntax--query-cache
-            (treesit-query-compile
-             'posix-awk
-             '((comment) @comment
-               ((_ ["(" ")" "[" "]" "{" "}"] @delimiter)
-                (:pred awk-ts-mode--delimiter-p @delimiter)))
-             t))))
+(defconst awk-ts-mode-syntax--query
+  (treesit-query-compile
+   'posix-awk
+   '((comment) @comment
+     ((_ ["(" ")" "[" "]" "{" "}"] @delimiter)
+      (:pred awk-ts-mode--delimiter-p @delimiter))))
+  "Compiled syntax query for POSIX awk.")
 
 ;;;;; Propertization
 
 (defun awk-ts-mode-syntax--delimiter-syntax (position)
-  "Return syntax-table syntax for the delimiter at POSITION."
+  "Return the syntax descriptor for the delimiter at POSITION."
   (pcase (char-after position)
     (?\( (string-to-syntax "()"))
     (?\) (string-to-syntax ")("))
@@ -117,7 +111,7 @@
         (syntax-ppss-flush-cache start))
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
-                        (awk-ts-mode-syntax--query) start end))
+                        awk-ts-mode-syntax--query start end))
         (let* ((name (car capture))
                (node (cdr capture))
                (position (if (eq name 'comment)
@@ -156,7 +150,7 @@
 ;;;;; Settings
 
 (defun awk-ts-mode-font-lock--settings ()
-  "Return the font-lock settings."
+  "Return font-lock settings for the current buffer."
   (treesit-font-lock-rules
    :default-language 'posix-awk
 
@@ -262,7 +256,7 @@
 ;;;;; Setup
 
 (defun awk-ts-mode-font-lock-setup ()
-  "Configure font locking for the current buffer."
+  "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               awk-ts-mode-font-lock--feature-list)
   (setq-local treesit-font-lock-settings
@@ -289,7 +283,8 @@
 
 (defun awk-ts-mode-navigation-setup ()
   "Configure navigation for the current buffer."
-  (setq-local treesit-thing-settings awk-ts-mode-thing-settings))
+  (setq-local treesit-thing-settings
+              awk-ts-mode-thing-settings))
 
 ;;;; Imenu
 
@@ -299,7 +294,7 @@
   "Tree-sitter Imenu settings for POSIX awk.")
 
 (defun awk-ts-mode--defun-name (node)
-  "Return the name of the function item NODE."
+  "Return the source name of NODE, or nil if it has no name."
   (when (awk-ts-mode--function-item-p node)
     (let ((name (treesit-node-child-by-field-name node "name")))
       (when (member (treesit-node-type name) '("name" "func_name"))
@@ -307,8 +302,10 @@
 
 (defun awk-ts-mode-imenu-setup ()
   "Configure Imenu for the current buffer."
-  (setq-local treesit-defun-name-function #'awk-ts-mode--defun-name)
-  (setq-local treesit-simple-imenu-settings awk-ts-mode-imenu-settings))
+  (setq-local treesit-defun-name-function
+              #'awk-ts-mode--defun-name)
+  (setq-local treesit-simple-imenu-settings
+              awk-ts-mode-imenu-settings))
 
 ;;;; Indentation
 

@@ -1,11 +1,11 @@
 # awk-ts-mode
 
-[![CI](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yml)
+[![CI](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yaml/badge.svg)](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yaml)
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
-[Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 `awk`.
+[Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 AWK.
 
-## Requirements
+## Requirement
 
 - Emacs 31.1 or later
 
@@ -25,7 +25,7 @@ Enabled for `.awk` files and scripts with an `awk` shebang.
 - Font Lock
 - Imenu: functions
 - Indentation
-- Navigation: `defun`, `sexp`
+- Navigation
 - Syntax Table
 
 ## Font Lock
