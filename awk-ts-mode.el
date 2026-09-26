@@ -35,45 +35,64 @@
 ;;; Code:
 
 (require 'treesit)
+(require 'elec-pair)
 
 (defgroup awk-ts nil
   "Tree-sitter mode for POSIX awk."
   :group 'languages)
 
+;;;; Grammar
+
 (defconst awk-ts-mode--grammar-sources
   '((posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-               :revision "v0.16.0"))
+               :revision "v0.18.0"))
   "Tree-sitter grammar sources for POSIX awk.")
+
+(defun awk-ts-mode--ensure-grammar (language)
+  "Ensure that the grammar for LANGUAGE is installed."
+  (let ((treesit-language-source-alist
+         (if (assq language treesit-language-source-alist)
+             treesit-language-source-alist
+           (cons (assq language awk-ts-mode--grammar-sources)
+                 treesit-language-source-alist))))
+    (or (treesit-ensure-installed language)
+        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 ;;;; Context
 
-(defun awk-ts-mode--ancestor-p (node type)
-  "Return non-nil when NODE or an ancestor has TYPE."
-  (let (found)
-    (while (and node (not found))
-      (when (equal (treesit-node-type node) type)
-        (setq found t))
-      (setq node (treesit-node-parent node)))
-    found))
+(defconst awk-ts-mode--expression-types
+  '("non_unary_expr" "unary_expr" "non_unary_print_expr" "unary_print_expr")
+  "Node types that can own AWK expression structure.")
 
-(defun awk-ts-mode--delimiter-p (node)
-  "Return non-nil when NODE is a structural delimiter."
-  (let* ((type (treesit-node-type node))
-         (parent (treesit-node-parent node))
-         (parent-type (and parent (treesit-node-type parent))))
-    (and parent
-         (not (equal parent-type "ERROR"))
-         (not (awk-ts-mode--ancestor-p parent "ere"))
-         (or (not (member type '("{" "}")))
-             (equal parent-type "action")))))
+(defun awk-ts-mode--delimiter-query (capture)
+  "Return a query for structural delimiters with CAPTURE."
+  `((action ["{" "}"] ,capture)
+    (item ["(" ")"] ,capture)
+    (terminated_statement ["(" ")"] ,capture)
+    (unterminated_statement ["(" ")"] ,capture)
+    (terminatable_statement ["(" ")"] ,capture)
+    (simple_print_statement ["(" ")"] ,capture)
+    (non_unary_expr ["(" ")"] ,capture)
+    (non_unary_print_expr ["(" ")"] ,capture)
+    (lvalue ["[" "]"] ,capture)
+    (simple_statement ["[" "]"] ,capture)))
 
 ;;;; Syntax
 
-(defvar awk-ts-mode-syntax-table
+(defvar awk-ts-mode-syntax--text-table
   (let ((table (make-syntax-table prog-mode-syntax-table)))
-    (dolist (character '(?# ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
+    (dolist (character '(?# ?' ?` ?\" ?\\ ?\( ?\) ?\[ ?\] ?{ ?}))
       (modify-syntax-entry character "." table))
     (modify-syntax-entry ?\n ">" table)
+    table)
+  "Syntax table for text without a CST syntax classification.")
+
+(defvar awk-ts-mode-syntax-table
+  (let ((table (copy-syntax-table awk-ts-mode-syntax--text-table)))
+    (dolist (entry '((?\( . "()") (?\) . ")(")
+                     (?\[ . "(]") (?\] . ")[")
+                     (?{ . "(}") (?} . "){")))
+      (modify-syntax-entry (car entry) (cdr entry) table))
     table)
   "Syntax table for `awk-ts-mode'.")
 
@@ -82,9 +101,9 @@
 (defconst awk-ts-mode-syntax--query
   (treesit-query-compile
    'posix-awk
-   '((comment) @comment
-     ((_ ["(" ")" "[" "]" "{" "}"] @delimiter)
-      (:pred awk-ts-mode--delimiter-p @delimiter))))
+   (append '((comment) @comment
+             [(string) (ere)] @string)
+           (awk-ts-mode--delimiter-query '@delimiter)))
   "Compiled syntax query for POSIX awk.")
 
 ;;;;; Propertization
@@ -106,9 +125,9 @@
       (widen)
       (when (and (= start accessible-start)
                  (> accessible-start (point-min)))
-        (remove-text-properties (point-min) start '(syntax-table nil))
         (setq start (point-min))
         (syntax-ppss-flush-cache start))
+      (put-text-property start end 'syntax-table awk-ts-mode-syntax--text-table)
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
                         awk-ts-mode-syntax--query start end))
@@ -117,15 +136,24 @@
                (position (if (eq name 'comment)
                              (treesit-node-start node)
                            (1- (treesit-node-end node)))))
-          (put-text-property
-           position (1+ position) 'syntax-table
-           (if (eq name 'comment)
-               (string-to-syntax "<")
-             (awk-ts-mode-syntax--delimiter-syntax position))))))))
+          (if (eq name 'string)
+              (let ((opening (treesit-node-child-by-field-name node "opening"))
+                    (closing (treesit-node-child-by-field-name node "closing")))
+                (when (and opening closing
+                           (not (treesit-node-check node 'has-error)))
+                  (dolist (position (list (treesit-node-start opening)
+                                          (1- (treesit-node-end closing))))
+                    (put-text-property position (1+ position) 'syntax-table
+                                       (string-to-syntax "|")))))
+            (put-text-property
+             position (1+ position) 'syntax-table
+             (if (eq name 'comment)
+                 (string-to-syntax "<")
+               (awk-ts-mode-syntax--delimiter-syntax position)))))))))
 
 ;;;;; Setup
 
-(defun awk-ts-mode-syntax-setup ()
+(defun awk-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
   (setq-local syntax-propertize-function
               #'awk-ts-mode-syntax--propertize)
@@ -135,6 +163,42 @@
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
   (setq-local comment-use-syntax t))
+
+;;;; Electric Pair
+
+(defun awk-ts-mode-electric-pair--newline-context-p ()
+  "Return non-nil for a multiline CST delimiter pair around the newline."
+  (when (and (eq (char-before) ?\n)
+             (>= (- (point) 2) (point-min))
+             (< (point) (point-max)))
+    (let* ((opening (treesit-node-at (- (point) 2) treesit-primary-parser))
+           (closing (treesit-node-at (point) treesit-primary-parser))
+           (owner (treesit-node-parent opening))
+           (type (treesit-node-type owner)))
+      (and (= (treesit-node-start opening) (- (point) 2))
+           (= (treesit-node-end opening) (1- (point)))
+           (= (treesit-node-start closing) (point))
+           (= (treesit-node-end closing) (1+ (point)))
+           (treesit-node-eq owner (treesit-node-parent closing))
+           (or (equal type "action")
+               (member type awk-ts-mode--expression-types)
+               (and (equal (treesit-node-type opening) "[")
+                    (member type '("lvalue" "simple_statement"))))))))
+
+(defun awk-ts-mode-electric-pair--setup ()
+  "Configure electric pairing for the current buffer."
+  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+        (table (copy-syntax-table (syntax-table))))
+    (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
+    (dolist (pair pairs)
+      (unless (eq (cdr (assq (car pair) electric-pair-pairs)) (cdr pair))
+        (modify-syntax-entry (car pair) "." table)))
+    (set-syntax-table table))
+  (let ((setting electric-pair-open-newline-between-pairs))
+    (setq-local electric-pair-open-newline-between-pairs
+                (lambda ()
+                  (and (if (functionp setting) (funcall setting) setting)
+                       (awk-ts-mode-electric-pair--newline-context-p))))))
 
 ;;;; Font Lock
 
@@ -249,13 +313,11 @@
    '(["," ";" "\\"] @font-lock-punctuation-face)
 
    :feature 'bracket
-   '(((["(" ")" "[" "]" "{" "}"]
-       @font-lock-bracket-face)
-      (:pred awk-ts-mode--delimiter-p @font-lock-bracket-face)))))
+   (awk-ts-mode--delimiter-query '@font-lock-bracket-face)))
 
 ;;;;; Setup
 
-(defun awk-ts-mode-font-lock-setup ()
+(defun awk-ts-mode-font-lock--setup ()
   "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               awk-ts-mode-font-lock--feature-list)
@@ -264,48 +326,77 @@
 
 ;;;; Navigation
 
-(defconst awk-ts-mode--item-regexp
+(defconst awk-ts-mode-navigation--item-regexp
   "^item$"
   "Regexp matching POSIX awk items.")
 
-(defun awk-ts-mode--function-item-p (node)
+(defun awk-ts-mode-navigation--defun-p (node)
   "Return non-nil when NODE is a POSIX awk function item."
-  (and (treesit-node-match-p node awk-ts-mode--item-regexp)
+  (and (treesit-node-match-p node awk-ts-mode-navigation--item-regexp)
        (treesit-node-child-by-field-name node "name")
        (treesit-node-child-by-field-name node "body")))
 
-(defconst awk-ts-mode-thing-settings
+(defun awk-ts-mode-navigation--sexp-p (node)
+  "Return non-nil when NODE represents an AWK editing unit."
+  (let ((type (treesit-node-type node)))
+    (and (< (treesit-node-start node) (treesit-node-end node))
+         (cond
+          ((member type '("item" "action" "name" "func_name"
+                          "builtin_func_name" "number" "string" "ere"
+                          "non_unary_input_function" "unary_input_function")))
+          ((equal type "simple_statement")
+           (member (treesit-node-field-name node) '("initializer" "update")))
+          ((member type '("terminated_statement" "unterminated_statement"))
+           (let ((children (treesit-node-children node t)))
+             (while (and children
+                         (member (treesit-node-type (car children))
+                                 '("comment" "newline" "newline_opt")))
+               (setq children (cdr children)))
+             children))
+          ((member type awk-ts-mode--expression-types)
+           (or (treesit-node-child-by-field-name node "operator")
+               (treesit-node-child-by-field-name node "condition")
+               (and (treesit-node-child-by-field-name node "left")
+                    (treesit-node-child-by-field-name node "right"))
+               (member "(" (mapcar #'treesit-node-type
+                                   (treesit-node-children node)))))
+          ((equal type "lvalue")
+           (or (treesit-node-child-by-field-name node "operand")
+               (member "expr_list" (mapcar #'treesit-node-type
+                                           (treesit-node-children node t)))))))))
+
+(defconst awk-ts-mode-navigation--settings
   `((posix-awk
-     (sexp ,awk-ts-mode--item-regexp)
-     (defun (,awk-ts-mode--item-regexp
-             . awk-ts-mode--function-item-p))))
+     (sexp awk-ts-mode-navigation--sexp-p)
+     (defun (,awk-ts-mode-navigation--item-regexp
+             . awk-ts-mode-navigation--defun-p))))
   "Tree-sitter thing definitions for POSIX awk.")
 
-(defun awk-ts-mode-navigation-setup ()
+(defun awk-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
   (setq-local treesit-thing-settings
-              awk-ts-mode-thing-settings))
+              awk-ts-mode-navigation--settings))
 
 ;;;; Imenu
 
-(defconst awk-ts-mode-imenu-settings
-  `(("Function" ,awk-ts-mode--item-regexp
-     awk-ts-mode--function-item-p nil))
-  "Tree-sitter Imenu settings for POSIX awk.")
-
-(defun awk-ts-mode--defun-name (node)
+(defun awk-ts-mode-imenu--name (node)
   "Return the source name of NODE, or nil if it has no name."
-  (when (awk-ts-mode--function-item-p node)
+  (when (awk-ts-mode-navigation--defun-p node)
     (let ((name (treesit-node-child-by-field-name node "name")))
       (when (member (treesit-node-type name) '("name" "func_name"))
         (treesit-node-text name t)))))
 
-(defun awk-ts-mode-imenu-setup ()
+(defconst awk-ts-mode-imenu--settings
+  `(("Function" ,awk-ts-mode-navigation--item-regexp
+     awk-ts-mode-navigation--defun-p nil))
+  "Tree-sitter Imenu settings for POSIX awk.")
+
+(defun awk-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
   (setq-local treesit-defun-name-function
-              #'awk-ts-mode--defun-name)
+              #'awk-ts-mode-imenu--name)
   (setq-local treesit-simple-imenu-settings
-              awk-ts-mode-imenu-settings))
+              awk-ts-mode-imenu--settings))
 
 ;;;; Indentation
 
@@ -314,46 +405,51 @@
   :type 'natnum
   :group 'awk-ts)
 
-(defconst awk-ts-mode-indent-rules
+(defconst awk-ts-mode-indent--rules
   '((posix-awk
-     ((node-is "}") parent-bol 0)
+     ((and (node-is "}")
+           (lambda (node _parent _bol)
+             (not (treesit-node-check node 'missing))))
+      parent-bol 0)
      ((node-is "else_keyword") parent-bol 0)
      ((node-is "while_keyword") parent-bol 0)
      ((field-is "body") parent-bol awk-ts-mode-indent-offset)
      ((field-is "consequence") parent-bol awk-ts-mode-indent-offset)
      ((field-is "alternative") parent-bol awk-ts-mode-indent-offset)
+     ((parent-is "action") parent-bol awk-ts-mode-indent-offset)
+     ((n-p-gp nil "newline_opt" "action")
+      parent-bol awk-ts-mode-indent-offset)
+     ((and (n-p-gp nil "newline_opt" "terminated_statement")
+           (lambda (_node parent _bol)
+             (member "action"
+                     (mapcar #'treesit-node-type
+                             (treesit-node-children
+                              (treesit-node-parent parent) t)))))
+      parent-bol 0)
+     ((node-is "newline_opt") parent-bol 0)
      ((parent-is "terminated_statement_list") first-sibling 0)
      ((parent-is "unterminated_statement_list") first-sibling 0)
      ((parent-is "program") column-0 0)
      ((parent-is "item_list") column-0 0)))
   "Tree-sitter indentation rules for POSIX awk.")
 
-(defun awk-ts-mode-indent-setup ()
+(defun awk-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
   (setq-local treesit-simple-indent-rules
-              awk-ts-mode-indent-rules))
+              awk-ts-mode-indent--rules))
 
 ;;;; Mode
-
-(defun awk-ts-mode--ensure-grammar (language)
-  "Ensure that the grammar for LANGUAGE is installed."
-  (let ((treesit-language-source-alist
-         (if (assq language treesit-language-source-alist)
-             treesit-language-source-alist
-           (cons (assq language awk-ts-mode--grammar-sources)
-                 treesit-language-source-alist))))
-    (or (treesit-ensure-installed language)
-        (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
 (defun awk-ts-mode--setup ()
   "Configure `awk-ts-mode' in the current buffer."
   (awk-ts-mode--ensure-grammar 'posix-awk)
   (setq-local treesit-primary-parser (treesit-parser-create 'posix-awk))
-  (awk-ts-mode-syntax-setup)
-  (awk-ts-mode-font-lock-setup)
-  (awk-ts-mode-navigation-setup)
-  (awk-ts-mode-imenu-setup)
-  (awk-ts-mode-indent-setup)
+  (awk-ts-mode-syntax--setup)
+  (awk-ts-mode-electric-pair--setup)
+  (awk-ts-mode-font-lock--setup)
+  (awk-ts-mode-navigation--setup)
+  (awk-ts-mode-imenu--setup)
+  (awk-ts-mode-indent--setup)
   (treesit-major-mode-setup))
 
 ;;;###autoload

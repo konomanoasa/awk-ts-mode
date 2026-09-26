@@ -3,11 +3,12 @@
 [![CI](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yaml/badge.svg)](https://github.com/konomanoasa/awk-ts-mode/actions/workflows/ci.yaml)
 
 [Tree-sitter](https://tree-sitter.github.io/tree-sitter/)-based
-[Emacs](https://www.gnu.org/software/emacs/) major mode for POSIX.1-2024 AWK.
+[Emacs](https://www.gnu.org/software/emacs/) major mode for
+POSIX.1-2024 AWK.
 
 ## Requirement
 
-- Emacs 31.1 or later
+Emacs 31.1 or later.
 
 ## Installation
 
@@ -22,8 +23,9 @@ Enabled for `.awk` files and scripts with an `awk` shebang.
 ## Features
 
 - Comment Commands
+- Electric Pair
 - Font Lock
-- Imenu: functions
+- Imenu
 - Indentation
 - Navigation
 - Syntax Table
@@ -32,12 +34,12 @@ Enabled for `.awk` files and scripts with an `awk` shebang.
 
 Supports `treesit-font-lock-level`.
 
-| Level | Font Lock |
-| --- | --- |
-| 1 | Comments |
-| 2 | Built-in functions, function definitions and calls, keywords, parameters, strings, and variable names and uses |
-| 3 | Numbers and escapes outside static EREs |
-| 4 | Operators, punctuation, brackets, and static EREs |
+| Level | Font Lock                                                                                                      |
+| ----- | -------------------------------------------------------------------------------------------------------------- |
+| 1     | Comments                                                                                                       |
+| 2     | Built-in functions, function definitions and calls, keywords, parameters, strings, and variable names and uses |
+| 3     | Numbers and escapes outside static EREs                                                                        |
+| 4     | Operators, punctuation, brackets, and static EREs                                                              |
 
 ## Grammar
 

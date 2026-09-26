@@ -1,5 +1,26 @@
 ;;; awk-ts-mode-test.el --- Tests for awk-ts-mode  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 konomanoasa
+;;
+;; Permission is hereby granted, free of charge, to any person obtaining
+;; a copy of this software and associated documentation files (the
+;; "Software"), to deal in the Software without restriction, including
+;; without limitation the rights to use, copy, modify, merge, publish,
+;; distribute, sublicense, and/or sell copies of the Software, and to
+;; permit persons to whom the Software is furnished to do so, subject to
+;; the following conditions:
+;;
+;; The above copyright notice and this permission notice shall be
+;; included in all copies or substantial portions of the Software.
+;;
+;; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+;; EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+;; MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+;; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+;; LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+;; OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+;; WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ;;; Code:
 
 (require 'ert)
@@ -46,7 +67,7 @@
 (defun awk-ts-mode-test--should-have-faces (cases)
   (pcase-dolist (`(,line ,fragment ,face) cases)
     (ert-info ((format "%S: %S" line fragment))
-      (should (eq (awk-ts-mode-test--face fragment nil line) face)))))
+              (should (eq (awk-ts-mode-test--face fragment nil line) face)))))
 
 (defun awk-ts-mode-test--fontify (level lines)
   (let ((treesit-font-lock-level level))
@@ -54,14 +75,11 @@
     (awk-ts-mode)
     (font-lock-ensure)))
 
-(defun awk-ts-mode-test--face-at-next (text)
-  (search-forward text)
-  (get-text-property (1- (point)) 'face))
-
 (defun awk-ts-mode-test--should-have-next-faces (cases)
-  (dolist (case cases)
-    (should (eq (awk-ts-mode-test--face-at-next (car case))
-                (nth 1 case)))))
+  (pcase-dolist (`(,fragment ,face) cases)
+    (ert-info ((format "%S" fragment))
+              (search-forward fragment)
+              (should (eq (get-text-property (1- (point)) 'face) face)))))
 
 (defun awk-ts-mode-test--indent (source &optional offset)
   (with-temp-buffer
@@ -189,6 +207,30 @@
                    "BEGIN { print 1 }\n"))))
 
 (ert-deftest awk-ts-mode-classifies-delimiters ()
+  (dolist (source '("function f(x) { return x }\n"
+                    "BEGIN { if (x) print x\n}\n"
+                    "BEGIN { if (x) print x }\n"
+                    "BEGIN { while (x) x-- }\n"
+                    "BEGIN { for (i = 0; i < 3; i++) print i }\n"
+                    "BEGIN { for (i in a) print a[i] }\n"
+                    "BEGIN { do x--; while (x) }\n"
+                    "BEGIN { print (x, y); printf(x, y) }\n"
+                    "BEGIN { x = f((y)); print length(y), (x) }\n"
+                    "BEGIN { x = ((x, y) in a); delete a[x, y] }\n"))
+    (with-temp-buffer
+      (insert source)
+      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+      (font-lock-ensure)
+      (should-not (treesit-node-check
+                   (treesit-parser-root-node treesit-primary-parser) 'has-error))
+      (goto-char (point-min))
+      (while (re-search-forward "[][(){}]" nil t)
+        (let ((position (1- (point))))
+          (ert-info ((format "%S at %d" source position))
+            (should (= (syntax-class (syntax-after position))
+                       (if (memq (char-after position) '(?\( ?\[ ?{)) 4 5)))
+            (should (eq (get-text-property position 'face)
+                        'font-lock-bracket-face)))))))
   (with-temp-buffer
     (let ((header "function f(a) {")
           (statement "  if ((a[1])) print f(a)")
@@ -196,8 +238,8 @@
           (closing "}"))
       (insert header "\n" statement "\n" regexp "\n" closing "\n")
       (awk-ts-mode)
-      (dolist (character '(?\( ?\) ?\[ ?\] ?{ ?}))
-        (should (eq (char-syntax character) ?.)))
+      (dolist (pair '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+        (should (eq (matching-paren (car pair)) (cdr pair))))
       (dolist (expectation
                `((,header "f(" 1 4)
                  (,header "a)" 1 5)
@@ -255,6 +297,38 @@
       (should (awk-ts-mode-test--comment-p "backslash" nil continued))
       (should-not (awk-ts-mode-test--comment-p "print" nil next)))))
 
+(ert-deftest awk-ts-mode-fences-complete-strings-and-regexps ()
+  (dolist (literal '("\"a\\\"#b\"" "/a\\/#b/" "/[[:alpha:]]/"))
+    (with-temp-buffer
+      (insert "BEGIN { print " literal " } # comment\n")
+      (awk-ts-mode)
+      (let ((start 15)
+            (end (+ 15 (length literal))))
+        (syntax-propertize (point-max))
+        (should (= (syntax-class (syntax-after start)) 15))
+        (should (= (syntax-class (syntax-after (1- end))) 15))
+        (should (nth 3 (syntax-ppss (1+ start))))
+        (should-not (nth 4 (syntax-ppss (1- end))))
+        (should-not (nth 3 (syntax-ppss end)))
+        (should (awk-ts-mode-test--comment-p "comment"))))))
+
+(ert-deftest awk-ts-mode-refreshes-string-fences-after-edits-and-narrowing ()
+  (with-temp-buffer
+    (insert "BEGIN { print \"abc\" }\n")
+    (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+    (syntax-propertize (point-max))
+    (goto-char 19)
+    (delete-char 1)
+    (syntax-propertize (point-max))
+    (should (= (syntax-class (syntax-after 15)) 1))
+    (insert "\"")
+    (awk-ts-mode-test--should-match-fresh-buffer 4)
+    (narrow-to-region 16 19)
+    (syntax-propertize (point-max))
+    (widen)
+    (should (nth 3 (syntax-ppss 17)))
+    (should-not (nth 3 (syntax-ppss 20)))))
+
 (ert-deftest awk-ts-mode-keeps-comments-open-through-buffer-end ()
   (dolist (source '("# note" "#"))
     (with-temp-buffer
@@ -262,6 +336,98 @@
       (awk-ts-mode)
       (syntax-propertize (point-max))
       (should (nth 4 (syntax-ppss (point-max)))))))
+
+;;;; Electric Pair
+
+(ert-deftest awk-ts-mode-opens-indented-line-between-braces ()
+  (pcase-dolist (`(,prefix ,suffix ,offset ,expand ,expected ,column)
+                 '(("function func() " "" 2 t "function func() {\n  \n}" 2)
+                   ("BEGIN " "" 4 t "BEGIN {\n    \n}" 4)
+                   ("BEGIN {\n  if (ready) " "\n}" 2 t
+                    "BEGIN {\n  if (ready) {\n    \n  }\n}" 4)
+                   ("function func() " "" 2 nil "function func() {\n}" 0)))
+    (ert-info ((format "Expand %S, offset %s: %S" expand offset prefix))
+      (let ((electric-pair-open-newline-between-pairs expand))
+        (with-temp-buffer
+          (insert prefix suffix)
+          (awk-ts-mode)
+          (setq-local indent-tabs-mode nil)
+          (setq-local awk-ts-mode-indent-offset offset)
+          (electric-indent-local-mode 1)
+          (electric-pair-local-mode 1)
+          (goto-char (1+ (length prefix)))
+          (let ((last-command-event ?{))
+            (self-insert-command 1))
+          (call-interactively (key-binding (kbd "RET")))
+          (should (equal (buffer-string) expected))
+          (should (= (current-column) column))
+          (when expand
+            (should (eolp))
+            (should (= (line-number-at-pos) (1+ (length (split-string prefix "\n")))))))))))
+
+(ert-deftest awk-ts-mode-supplies-electric-pairs ()
+  (let ((electric-pair-pairs '((?\" . ?\")))
+        (electric-pair-mode nil))
+    (pcase-dolist (`(,source ,character ,expected)
+                   '(("BEGIN " ?{ "BEGIN {}")
+                     ("BEGIN { print " ?\( "BEGIN { print ()")
+                     ("BEGIN { print a" ?\[ "BEGIN { print a[]")))
+      (with-temp-buffer
+        (insert source)
+        (awk-ts-mode)
+        (should-not electric-pair-mode)
+        (should (local-variable-p 'electric-pair-pairs))
+        (electric-pair-local-mode 1)
+        (let ((last-command-event character))
+          (self-insert-command 1))
+        (should (equal (buffer-string) expected))
+        (should (= (point) (1- (point-max))))))
+    (should (equal electric-pair-pairs '((?\" . ?\")))))
+  (let ((electric-pair-pairs '((?{ . ?>))))
+    (with-temp-buffer
+      (insert "BEGIN ")
+      (awk-ts-mode)
+      (should (equal (assq ?{ electric-pair-pairs) '(?{ . ?>)))
+      (electric-pair-local-mode 1)
+      (let ((last-command-event ?{)) (self-insert-command 1))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "BEGIN {>")))))
+
+(ert-deftest awk-ts-mode-restricts-pair-newlines-to-cst-contexts ()
+  (let ((electric-pair-open-newline-between-pairs t))
+    (pcase-dolist (`(,before ,after ,expected)
+                   '(("BEGIN {" "}" "BEGIN {\n\n}")
+                     ("function f(" ") {}" "function f(\n) {}")
+                     ("# {" "}" "# {\n}")
+                     ("BEGIN { print \"{" "}\" }" "BEGIN { print \"{\n}\" }")
+                     ("BEGIN { print /(" ")/ }" "BEGIN { print /(\n)/ }")))
+      (ert-info ((format "%S / %S" before after))
+        (with-temp-buffer
+          (insert before after)
+          (awk-ts-mode)
+          (electric-indent-local-mode -1)
+          (electric-pair-local-mode 1)
+          (goto-char (1+ (length before)))
+          (call-interactively (key-binding (kbd "RET")))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         expected)))))))
+
+(ert-deftest awk-ts-mode-respects-pair-newline-preferences ()
+  (dolist (enabled '(nil t))
+    (let* ((calls 0)
+           (setting (lambda () (setq calls (1+ calls)) enabled))
+           (electric-pair-open-newline-between-pairs setting))
+      (with-temp-buffer
+        (insert "BEGIN {}")
+        (awk-ts-mode)
+        (electric-indent-local-mode -1)
+        (electric-pair-local-mode 1)
+        (goto-char 8)
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                       (if enabled "BEGIN {\n\n}" "BEGIN {\n}")))
+        (should (> calls 0)))
+      (should (eq electric-pair-open-newline-between-pairs setting)))))
 
 ;;;; Font Lock
 
@@ -560,6 +726,69 @@
       (should (eq (char-before) ?\n))
       (should (eq (char-before (1- (point))) ?})))))
 
+(ert-deftest awk-ts-mode-navigates-cst-editing-units ()
+  (pcase-dolist (`(,prefix ,unit ,suffix)
+                 '(("BEGIN { print " "value" ", tail; }\n")
+                   ("BEGIN { print " "12.5" ", tail; }\n")
+                   ("BEGIN { print " "\"two words\"" ", tail; }\n")
+                   ("BEGIN { print " "/ab+/" ", tail; }\n")
+                   ("BEGIN { print " "a + b * c" ", tail; }\n")
+                   ("BEGIN { print " "a b" ", tail; }\n")
+                   ("BEGIN { print " "a ? b : c" ", tail; }\n")
+                   ("BEGIN { print " "-a" ", tail; }\n")
+                   ("BEGIN { print " "f(a, b)" ", tail; }\n")
+                   ("BEGIN { print " "length(a)" ", tail; }\n")
+                   ("BEGIN { print " "(a + b)" ", tail; }\n")
+                   ("BEGIN { print " "a[i, j]" ", tail; }\n")
+                   ("BEGIN { print " "$2" ", tail; }\n")
+                   ("BEGIN { print (" "getline x" "), tail; }\n")
+                   ("BEGIN { " "print x;" " print y; }\n")
+                   ("BEGIN { " "if (x) print y;" " print z; }\n")
+                   ("BEGIN { " "{ print x; }" " print y; }\n")
+                   ("BEGIN { for (" "i = 0" "; i < 3; i++) print i; }\n")
+                   ("BEGIN { for (i = 0; i < 3; " "i++" ") print i; }\n")))
+    (ert-info ((format "%S" unit))
+      (with-temp-buffer
+        (insert prefix unit suffix)
+        (awk-ts-mode)
+        (should-not (treesit-node-check (treesit-buffer-root-node 'posix-awk) 'has-error))
+        (let ((start (1+ (length prefix)))
+              (end (1+ (+ (length prefix) (length unit)))))
+          (goto-char start)
+          (forward-sexp)
+          (should (= (point) end))
+          (backward-sexp)
+          (should (= (point) start)))))))
+
+(ert-deftest awk-ts-mode-excludes-sexp-wrappers-and-empty-statements ()
+  (with-temp-buffer
+    (insert "BEGIN { ; print a[1], value, \"text\"; }\n")
+    (awk-ts-mode)
+    (dolist (node (treesit-query-capture
+                   (treesit-buffer-root-node 'posix-awk)
+                   '([(expr) (print_expr) (expr_list) (string_content)
+                      (non_unary_expr) (non_unary_print_expr) (lvalue)
+                      (terminated_statement)] @candidate) nil nil t))
+      (when (member (treesit-node-text node t)
+                    '(";" "value" "text" "1"))
+        (should-not (awk-ts-mode-navigation--sexp-p node))))))
+
+(ert-deftest awk-ts-mode-navigates-nested-boundaries-and-edited-expressions ()
+  (with-temp-buffer
+    (insert "BEGIN { print a + b * c, tail; }\n")
+    (awk-ts-mode)
+    (goto-char (awk-ts-mode-test--position "b * c"))
+    (forward-sexp)
+    (should (= (point) (+ (awk-ts-mode-test--position "a + b * c") 9)))
+    (backward-sexp)
+    (should (= (point) (awk-ts-mode-test--position "a + b * c")))
+    (delete-region (point) (+ (point) 9))
+    (insert "array[index]")
+    (backward-sexp)
+    (should (= (point) (awk-ts-mode-test--position "array[index]")))
+    (forward-sexp)
+    (should (= (point) (+ (awk-ts-mode-test--position "array[index]") 12)))))
+
 ;;;; Imenu
 
 (ert-deftest awk-ts-mode-indexes-definitions ()
@@ -586,6 +815,31 @@
       (should-not (treesit-defun-name root)))))
 
 ;;;; Indentation
+
+(ert-deftest awk-ts-mode-indents-after-return ()
+  (pcase-dolist (`(,source ,line ,offset ,expected)
+                 '(("BEGIN {\n\n}" 0 2 "BEGIN {\n  \n\n}")
+                   ("BEGIN {\n  print 1\n}" 1 2 "BEGIN {\n  print 1\n  \n}")
+                   ("BEGIN {\n  if (ready) {\n\n  }\n}" 1 2 "BEGIN {\n  if (ready) {\n    \n\n  }\n}")
+                   ("BEGIN {\n  if (ready) {\n    print 1\n  }\n}" 3 2 "BEGIN {\n  if (ready) {\n    print 1\n  }\n  \n}")
+                   ("BEGIN {\n  {\n    print 1\n  }\n}" 3 2 "BEGIN {\n  {\n    print 1\n  }\n  \n}")
+                   ("BEGIN {\n  if (ready) {\n    print 1\n  } # done\n}" 3 2 "BEGIN {\n  if (ready) {\n    print 1\n  } # done\n  \n}")
+                   ("BEGIN {\n  if (ready) {\n    while (more) {\n      print 1\n    }\n  }\n}" 4 2 "BEGIN {\n  if (ready) {\n    while (more) {\n      print 1\n    }\n    \n  }\n}")
+                   ("BEGIN {\n    if (ready) {\n        print 1\n    }\n}" 3 4 "BEGIN {\n    if (ready) {\n        print 1\n    }\n    \n}")
+                   ("BEGIN {\n\n}" 0 4 "BEGIN {\n    \n\n}")
+                   ("BEGIN {}" 0 2 "BEGIN {}\n")))
+    (ert-info ((format "Return on line %s: %S" line source))
+      (with-temp-buffer
+        (insert source)
+        (awk-ts-mode)
+        (setq-local indent-tabs-mode nil)
+        (setq-local awk-ts-mode-indent-offset offset)
+        (electric-indent-local-mode 1)
+        (goto-char (point-min))
+        (forward-line line)
+        (end-of-line)
+        (call-interactively (key-binding (kbd "RET")))
+        (should (equal (buffer-string) expected))))))
 
 (ert-deftest awk-ts-mode-indents-structures ()
   (pcase-dolist (`(,source ,offset ,expected)
