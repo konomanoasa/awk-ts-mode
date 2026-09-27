@@ -34,8 +34,8 @@
 
 ;;; Code:
 
-(require 'treesit)
 (require 'elec-pair)
+(require 'treesit)
 
 (defgroup awk-ts nil
   "Tree-sitter mode for POSIX awk."
@@ -118,6 +118,26 @@
     (?{ (string-to-syntax "(}"))
     (?} (string-to-syntax "){"))))
 
+(defvar-local awk-ts-mode-syntax--changed-start nil
+  "Earliest pending syntax change reported by the parser.")
+
+(defun awk-ts-mode-syntax--changed (ranges _parser)
+  "Invalidate syntax properties for the parser's changed RANGES."
+  (dolist (range ranges)
+    (setq awk-ts-mode-syntax--changed-start
+          (min (or awk-ts-mode-syntax--changed-start (car range))
+               (car range))))
+  (when awk-ts-mode-syntax--changed-start
+    (syntax-ppss-flush-cache awk-ts-mode-syntax--changed-start)))
+
+(defun awk-ts-mode-syntax--extend-region (start end)
+  "Extend START and END to include pending structural changes."
+  (treesit-parser-root-node treesit-primary-parser)
+  (let ((begin awk-ts-mode-syntax--changed-start))
+    (setq awk-ts-mode-syntax--changed-start nil)
+    (when (and begin (< begin start))
+      (cons (max (point-min) begin) end))))
+
 (defun awk-ts-mode-syntax--propertize (start end)
   "Apply syntax properties between START and END."
   (let ((accessible-start (point-min)))
@@ -155,10 +175,18 @@
 
 (defun awk-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
+  (treesit-parser-add-notifier treesit-primary-parser #'awk-ts-mode-syntax--changed)
   (setq-local syntax-propertize-function
               #'awk-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
             #'syntax-propertize-wholelines nil t)
+  (add-hook 'syntax-propertize-extend-region-functions
+            #'awk-ts-mode-syntax--extend-region t t))
+
+;;;; Comment Commands
+
+(defun awk-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[[:blank:]]*")
@@ -187,7 +215,8 @@
 
 (defun awk-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
-  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
+  (let ((pairs '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})
+                 (?\" . ?\")))
         (table (copy-syntax-table (syntax-table))))
     (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
     (dolist (pair pairs)
@@ -405,6 +434,42 @@
   :type 'natnum
   :group 'awk-ts)
 
+(defun awk-ts-mode-indent--continuation (_node parent _bol)
+  "Return the indentation for expression continuation in PARENT."
+  (when (equal (treesit-node-type parent) "newline_opt")
+    (setq parent (treesit-node-parent parent)))
+  (when (member (treesit-node-type parent)
+                (append awk-ts-mode--expression-types
+                        '("print_expr_list" "multiple_expr_list"
+                          "param_list" "normal_pattern")))
+    (cons (save-excursion
+            (goto-char (treesit-node-start parent))
+            (back-to-indentation)
+            (point))
+          awk-ts-mode-indent-offset)))
+
+(defun awk-ts-mode-indent--statement-newline (node parent _bol)
+  "Return the indentation for statement layout at NODE in PARENT."
+  (let* ((layout (if (equal (treesit-node-type node) "newline_opt") node parent))
+         (statement (treesit-node-parent layout)))
+    (when (and (equal (treesit-node-type layout) "newline_opt")
+               (member (treesit-node-type statement)
+                       '("terminated_statement" "terminatable_statement")))
+      (let ((next (treesit-node-next-sibling layout t))
+            (offset 0))
+        (while (equal (treesit-node-type next) "comment")
+          (setq next (treesit-node-next-sibling next t)))
+        (if (member (treesit-node-field-name next) '("body" "consequence" "alternative"))
+            (setq offset awk-ts-mode-indent-offset)
+          (while (member (treesit-node-field-name statement)
+                         '("body" "consequence" "alternative"))
+            (setq statement (treesit-node-parent statement))))
+        (cons (save-excursion
+                (goto-char (treesit-node-start statement))
+                (back-to-indentation)
+                (point))
+              offset)))))
+
 (defconst awk-ts-mode-indent--rules
   '((posix-awk
      ((and (node-is "}")
@@ -417,15 +482,10 @@
      ((field-is "consequence") parent-bol awk-ts-mode-indent-offset)
      ((field-is "alternative") parent-bol awk-ts-mode-indent-offset)
      ((parent-is "action") parent-bol awk-ts-mode-indent-offset)
+     awk-ts-mode-indent--continuation
      ((n-p-gp nil "newline_opt" "action")
       parent-bol awk-ts-mode-indent-offset)
-     ((and (n-p-gp nil "newline_opt" "terminated_statement")
-           (lambda (_node parent _bol)
-             (member "action"
-                     (mapcar #'treesit-node-type
-                             (treesit-node-children
-                              (treesit-node-parent parent) t)))))
-      parent-bol 0)
+     awk-ts-mode-indent--statement-newline
      ((node-is "newline_opt") parent-bol 0)
      ((parent-is "terminated_statement_list") first-sibling 0)
      ((parent-is "unterminated_statement_list") first-sibling 0)
@@ -445,6 +505,7 @@
   (awk-ts-mode--ensure-grammar 'posix-awk)
   (setq-local treesit-primary-parser (treesit-parser-create 'posix-awk))
   (awk-ts-mode-syntax--setup)
+  (awk-ts-mode-comment--setup)
   (awk-ts-mode-electric-pair--setup)
   (awk-ts-mode-font-lock--setup)
   (awk-ts-mode-navigation--setup)
