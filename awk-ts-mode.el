@@ -45,7 +45,7 @@
 
 (defconst awk-ts-mode--grammar-sources
   '((posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-               :revision "v0.18.0"))
+               :revision "v0.19.0"))
   "Tree-sitter grammar sources for POSIX awk.")
 
 (defun awk-ts-mode--ensure-grammar (language)
@@ -57,6 +57,24 @@
                  treesit-language-source-alist))))
     (or (treesit-ensure-installed language)
         (user-error "Tree-sitter grammar `%s' is unavailable" language))))
+
+(defun awk-ts-mode--after-change (beg _end old-length)
+  "Reparse a BOM moved to the start by an edit at BEG of OLD-LENGTH."
+  (when (and (= beg 1) (> old-length 0))
+    (save-restriction
+      (widen)
+      (when (eq (char-after 1) #xfeff)
+        (let* ((parser treesit-primary-parser)
+               (language (treesit-parser-language parser))
+               (notifiers (treesit-parser-notifiers parser))
+               (level (treesit-parser-embed-level parser)))
+          (treesit-parser-delete parser)
+          (setq treesit-primary-parser (treesit-parser-create language))
+          (treesit-parser-set-embed-level treesit-primary-parser level)
+          (dolist (notifier notifiers)
+            (treesit-parser-add-notifier treesit-primary-parser notifier))
+          (syntax-ppss-flush-cache 1)
+          (font-lock-flush))))))
 
 ;;;; Context
 
@@ -290,15 +308,15 @@
    '((ere "/" @font-lock-delimiter-face))
 
    :feature 'regexp
-   '([(escape_sequence) (escaped_delimiter)] @font-lock-escape-face
-     (ordinary_character_content) @font-lock-regexp-face
-     (ordinary_character [")" "}"] @font-lock-regexp-face)
-     (collating_element_content) @font-lock-constant-face
-     (collating_element "-" @font-lock-constant-face)
-     (wildcard "." @font-lock-constant-face)
+   '([(quoted_character) (escape_sequence) (escaped_delimiter)]
+     @font-lock-escape-face
+     (ordinary_character !escape) @font-lock-regexp-face
+     [(collating_element_single) (collating_element_multi)
+      (collating_element_content)] @font-lock-constant-face
+     (one_char_or_coll_elem_ere "." @font-lock-constant-face)
      (class_name) @font-lock-constant-face
      (meta_character) @font-lock-constant-face
-     (dup_count) @font-lock-number-face
+     (duplication_count) @font-lock-number-face
      (start_range "-" @font-lock-operator-face)
      (range_expression "-" @font-lock-constant-face)
      (bracket_list "-" @font-lock-constant-face)
@@ -320,15 +338,15 @@
      (ere_expression
       ["(" ")"] @font-lock-bracket-face)
      (extended_reg_exp
-      operator: "|" @font-lock-operator-face)
-     [(left_anchor) (right_anchor)] @font-lock-operator-face
+      "|" @font-lock-operator-face)
+     (ere_expression ["^" "$"] @font-lock-operator-face)
      (ere_dupl_symbol
       ["*" "+" "?"] @font-lock-operator-face)
      (ere_dupl_symbol
       ["{" "}"] @font-lock-bracket-face)
      (ere_dupl_symbol
       "," @font-lock-punctuation-face)
-     (repetition_modifier "?" @font-lock-operator-face))
+     (repetition_modifier) @font-lock-operator-face)
 
    :feature 'operator
    '([(add_assign) (and) (append) (decr) (div_assign)
@@ -511,7 +529,8 @@
   (awk-ts-mode-navigation--setup)
   (awk-ts-mode-imenu--setup)
   (awk-ts-mode-indent--setup)
-  (treesit-major-mode-setup))
+  (treesit-major-mode-setup)
+  (add-hook 'after-change-functions #'awk-ts-mode--after-change nil t))
 
 ;;;###autoload
 (define-derived-mode awk-ts-mode prog-mode "Awk-TS"

@@ -768,6 +768,9 @@
                    ("BEGIN { print " "a[i, j]" ", tail; }\n")
                    ("BEGIN { print " "$2" ", tail; }\n")
                    ("BEGIN { print (" "getline x" "), tail; }\n")
+                   ("BEGIN { print (" "getline x++" "), tail; }\n")
+                   ("BEGIN { print (" "getline x < dir file" "), tail; }\n")
+                   ("BEGIN { print (" "command | getline x" "), tail; }\n")
                    ("BEGIN { " "print x;" " print y; }\n")
                    ("BEGIN { " "if (x) print y;" " print z; }\n")
                    ("BEGIN { " "{ print x; }" " print y; }\n")
@@ -902,6 +905,47 @@
       (should (equal (awk-ts-mode-test--indent source offset) expected)))))
 
 ;;;; Updates
+
+(ert-deftest awk-ts-mode-reparses-a-bom-moved-to-buffer-start ()
+  (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
+                 '((posix-awk "test.awk" "" "BEGIN {}\n" "# note\n" "note" font-lock-comment-face)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((default-directory
+               (file-name-as-directory (make-temp-file "awk-ts-mode-" t))))
+          (unwind-protect
+              (progn
+                (with-temp-file (expand-file-name ".editorconfig")
+                  (insert "root = true\n[*]\n" properties))
+                (with-temp-buffer
+                  (setq buffer-file-name (expand-file-name file))
+                  (insert prefix "\ufeff" body)
+                  (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+                  (awk-ts-mode-test--buffer-state)
+                  (when narrow
+                    (narrow-to-region 1 (+ 2 (length prefix))))
+                  (delete-region 1 (1+ (length prefix)))
+                  (widen)
+                  (should (eq (treesit-parser-language treesit-primary-parser) language))
+                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                  (let ((state (awk-ts-mode-test--buffer-state))
+                        (tree (treesit-node-string
+                               (treesit-parser-root-node treesit-primary-parser)))
+                        (source (buffer-substring-no-properties (point-min) (point-max)))
+                        (filename buffer-file-name))
+                    (should (equal source (concat "\ufeff" body)))
+                    (should-not (get-text-property 1 'face))
+                    (goto-char (point-min))
+                    (search-forward fragment)
+                    (should (eq (get-text-property (1- (point)) 'face) face))
+                    (with-temp-buffer
+                      (setq buffer-file-name filename)
+                      (insert source)
+                      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+                      (should (equal state (awk-ts-mode-test--buffer-state)))
+                      (should (equal tree (treesit-node-string
+                                           (treesit-parser-root-node treesit-primary-parser))))))))
+            (delete-directory default-directory t)))))))
 
 (ert-deftest awk-ts-mode-refreshes-syntax-before-multiline-errors ()
   (dolist (narrow '(nil t))
