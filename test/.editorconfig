@@ -1,0 +1,4 @@
+root = true
+
+[posix.awk]
+posix = true

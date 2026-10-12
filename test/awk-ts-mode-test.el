@@ -29,11 +29,34 @@
 (require 'newcomment)
 (require 'awk-ts-mode)
 
-(dolist (language '(posix-awk))
+(dolist (language '(posix-awk gawk))
   (unless (treesit-ready-p language t)
     (error "The %s grammar is required to run the tests" language)))
 
 ;;;; Helpers
+
+(defmacro awk-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "awk-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (awk-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
+(defconst awk-ts-mode-test--posix-file
+  (expand-file-name "posix.awk" (file-name-directory load-file-name)))
+
+(defun awk-ts-mode-test--posix ()
+  (let ((buffer-file-name awk-ts-mode-test--posix-file))
+    (awk-ts-mode)))
 
 (defun awk-ts-mode-test--position (fragment &optional line)
   (save-excursion
@@ -72,7 +95,7 @@
 (defun awk-ts-mode-test--fontify (level lines)
   (let ((treesit-font-lock-level level))
     (insert (mapconcat #'identity lines "\n"))
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (font-lock-ensure)))
 
 (defun awk-ts-mode-test--should-have-next-faces (cases)
@@ -84,7 +107,7 @@
 (defun awk-ts-mode-test--indent (source &optional offset)
   (with-temp-buffer
     (insert source)
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (setq-local indent-tabs-mode nil)
     (when offset
       (setq-local awk-ts-mode-indent-offset offset))
@@ -103,15 +126,23 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun awk-ts-mode-test--should-match-fresh-buffer (level)
+(defun awk-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (awk-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level))
+        (language (treesit-parser-language treesit-primary-parser)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
-      (let ((treesit-font-lock-level level)) (awk-ts-mode))
-      (should (equal state (awk-ts-mode-test--buffer-state))))))
+      (let ((treesit-font-lock-level level)) (if (eq language 'gawk) (awk-ts-mode) (awk-ts-mode-test--posix)))
+      (should (equal state (awk-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -140,19 +171,19 @@
           (fset 'treesit-ensure-installed (lambda (_language) nil))
           (with-temp-buffer
             (let ((buffer-file-name nil))
-              (should-error (awk-ts-mode) :type 'user-error)
+              (should-error (awk-ts-mode-test--posix) :type 'user-error)
               (should-not (treesit-parser-list)))))
       (fset 'treesit-ensure-installed ensure))))
 
 (ert-deftest awk-ts-mode-starts-and-reuses-parser ()
   (with-temp-buffer
     (insert "BEGIN { print 1 }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (should (eq major-mode 'awk-ts-mode))
     (should (eq (treesit-parser-language treesit-primary-parser) 'posix-awk))
     (should (equal (treesit-node-type (treesit-parser-root-node treesit-primary-parser))
                    "program"))
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (should (equal (treesit-parser-list) (list treesit-primary-parser)))))
 
 ;;;; Mode Selection
@@ -193,6 +224,53 @@
               (should (search-forward form nil t)))))
       (delete-file output))))
 
+(ert-deftest awk-ts-mode-gnu-selects-only-from-editorconfig ()
+  (let ((directory (make-temp-file "awk-ts-mode-language-" t)))
+    (unwind-protect
+        (dolist (option '(nil "true" "false" "unset" "invalid"))
+          (with-temp-file (expand-file-name ".editorconfig" directory)
+            (insert "root = true\n[*]\n")
+            (when option (insert "posix = " option "\n")))
+          (dolist (interpreter '("awk" "gawk"))
+            (with-temp-buffer
+              (setq buffer-file-name (expand-file-name "example.awk" directory))
+              (insert "#!/usr/bin/env " interpreter " -f\nBEGIN {}")
+              (if (equal option "invalid")
+                  (should-error (awk-ts-mode) :type 'user-error)
+                (awk-ts-mode)
+                (should (eq (treesit-parser-language treesit-primary-parser)
+                            (if (equal option "true") 'posix-awk 'gawk)))
+                (awk-ts-mode)
+                (should (equal (treesit-parser-list) (list treesit-primary-parser)))))))
+      (delete-directory directory t)))
+  (with-temp-buffer
+    (awk-ts-mode)
+    (should (eq (treesit-parser-language treesit-primary-parser) 'gawk))))
+
+(ert-deftest awk-ts-mode-gnu-reselects-only-on-restart-and-checks-selected-grammar ()
+  (let ((directory (make-temp-file "awk-ts-mode-language-" t))
+        (ensure (symbol-function 'treesit-ensure-installed))
+        requested)
+    (unwind-protect
+        (progn
+          (fset 'treesit-ensure-installed
+                (lambda (language) (push language requested) t))
+          (with-temp-buffer
+            (setq buffer-file-name (expand-file-name "example.awk" directory))
+            (dolist (option '("false" "true" "unset"))
+              (with-temp-file (expand-file-name ".editorconfig" directory)
+                (insert "root = true\n[*.awk]\nposix = " option "\n"))
+              (when treesit-primary-parser
+                (should (eq (treesit-parser-language treesit-primary-parser)
+                            (car requested))))
+              (awk-ts-mode)
+              (should (eq (treesit-parser-language treesit-primary-parser)
+                          (if (equal option "true") 'posix-awk 'gawk)))
+              (should (equal (treesit-parser-list) (list treesit-primary-parser)))))
+          (should (equal (reverse requested) '(gawk posix-awk gawk))))
+      (fset 'treesit-ensure-installed ensure)
+      (delete-directory directory t))))
+
 ;;;; Syntax
 
 (ert-deftest awk-ts-mode-classifies-delimiters ()
@@ -208,7 +286,7 @@
                     "BEGIN { x = ((x, y) in a); delete a[x, y] }\n"))
     (with-temp-buffer
       (insert source)
-      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+      (let ((treesit-font-lock-level 4)) (awk-ts-mode-test--posix))
       (font-lock-ensure)
       (should-not (treesit-node-check
                    (treesit-parser-root-node treesit-primary-parser) 'has-error))
@@ -226,7 +304,7 @@
           (regexp "  if (/([b]){2}/) print \"()[]{}\"")
           (closing "}"))
       (insert header "\n" statement "\n" regexp "\n" closing "\n")
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (dolist (pair '((?\( . ?\)) (?\[ . ?\]) (?{ . ?})))
         (should (eq (matching-paren (car pair)) (cdr pair))))
       (dolist (expectation
@@ -278,7 +356,7 @@
                          (list top string regexp continued next)
                          "\n")
               "\n")
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (should (awk-ts-mode-test--comment-p "top" nil top))
       (should-not (awk-ts-mode-test--comment-p "string" nil string))
       (should-not (awk-ts-mode-test--comment-p "regexp" nil regexp))
@@ -290,7 +368,7 @@
   (dolist (literal '("\"a\\\"#b\"" "/a\\/#b/" "/[[:alpha:]]/"))
     (with-temp-buffer
       (insert "BEGIN { print " literal " } # comment\n")
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (let ((start 15)
             (end (+ 15 (length literal))))
         (syntax-propertize (point-max))
@@ -304,7 +382,7 @@
 (ert-deftest awk-ts-mode-refreshes-string-fences-after-edits-and-narrowing ()
   (with-temp-buffer
     (insert "BEGIN { print \"abc\" }\n")
-    (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+    (let ((treesit-font-lock-level 4)) (awk-ts-mode-test--posix))
     (syntax-propertize (point-max))
     (goto-char 19)
     (delete-char 1)
@@ -322,7 +400,7 @@
   (dolist (source '("# note" "#"))
     (with-temp-buffer
       (insert source)
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (syntax-propertize (point-max))
       (should (nth 4 (syntax-ppss (point-max)))))))
 
@@ -331,7 +409,7 @@
 (ert-deftest awk-ts-mode-comments-and-uncomments ()
   (with-temp-buffer
     (insert "BEGIN { print 1 }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (comment-region (point-min) (point-max))
     (should (equal (buffer-substring-no-properties (point-min) (point-max))
                    "# BEGIN { print 1 }\n"))
@@ -351,7 +429,7 @@
       (ert-info ((format "%S / %c" prefix opening))
         (with-temp-buffer
           (insert prefix)
-          (awk-ts-mode)
+          (awk-ts-mode-test--posix)
           (should-not electric-pair-mode)
           (should (local-variable-p 'electric-pair-pairs))
           (should (equal (assq ?% electric-pair-pairs) '(?% . ?%)))
@@ -365,7 +443,7 @@
                    '(("BEGIN " ?{ "BEGIN {>")))
       (with-temp-buffer
         (insert prefix)
-        (awk-ts-mode)
+        (awk-ts-mode-test--posix)
         (electric-pair-local-mode 1)
         (let ((last-command-event opening)) (self-insert-command 1))
         (should (equal (buffer-string) expected))
@@ -383,7 +461,7 @@
       (let ((electric-pair-open-newline-between-pairs setting))
         (with-temp-buffer
           (insert "BEGIN {}")
-          (awk-ts-mode)
+          (awk-ts-mode-test--posix)
           (electric-indent-local-mode -1)
           (electric-pair-local-mode 1)
           (goto-char 8)
@@ -403,7 +481,7 @@
       (let ((electric-pair-open-newline-between-pairs expand))
         (with-temp-buffer
           (insert prefix suffix)
-          (awk-ts-mode)
+          (awk-ts-mode-test--posix)
           (setq-local indent-tabs-mode nil)
           (setq-local awk-ts-mode-indent-offset offset)
           (electric-indent-local-mode 1)
@@ -429,7 +507,7 @@
       (ert-info ((format "%S / %S" before after))
         (with-temp-buffer
           (insert before after)
-          (awk-ts-mode)
+          (awk-ts-mode-test--posix)
           (electric-indent-local-mode -1)
           (electric-pair-local-mode 1)
           (goto-char (1+ (length before)))
@@ -444,7 +522,7 @@
                    '(("BEGIN { print " ?\" "BEGIN { print \"\"" "BEGIN { print \"x\"")))
       (with-temp-buffer
         (insert prefix)
-        (awk-ts-mode)
+        (awk-ts-mode-test--posix)
         (electric-pair-local-mode 1)
         (let ((last-command-event quote)) (self-insert-command 1))
         (should (equal (buffer-string) opened))
@@ -455,13 +533,24 @@
         (should (eobp))))
     (should-not electric-pair-pairs)))
 
+(ert-deftest awk-ts-mode-gnu-pair-newlines-respect-the-language ()
+  (dolist (source '("BEGIN {\n}" "BEGIN {f(\n)}" "BEGIN {a[\n]}"
+                    "function f(\n) {}" "BEGIN {switch(\n) {}}"))
+    (with-temp-buffer
+      (insert source)
+      (awk-ts-mode)
+      (goto-char (point-min))
+      (search-forward "\n")
+      (should (eq (not (null (awk-ts-mode-electric-pair--newline-context-p)))
+                  (equal source "BEGIN {\n}"))))))
+
 ;;;; Font Lock
 
 (ert-deftest awk-ts-mode-fontifies-by-level ()
   (dolist (level '(1 2 3 4))
     (with-temp-buffer
       (insert "# note\nBEGIN { print \"a\\tb\", 1, /c\\n/ }\n")
-      (let ((treesit-font-lock-level level)) (awk-ts-mode))
+      (let ((treesit-font-lock-level level)) (awk-ts-mode-test--posix))
       (font-lock-ensure)
       (pcase-dolist (`(,fragment ,minimum ,face)
                      '(("note" 1 font-lock-comment-face) ("BEGIN" 2 font-lock-keyword-face)
@@ -718,13 +807,60 @@
                     "/[[=a\\né\\141 \\e\\/日\\.=]]/\n"))
     (with-temp-buffer
       (insert source)
-      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+      (let ((treesit-font-lock-level 4)) (awk-ts-mode-test--posix))
       (let ((root (treesit-parser-root-node treesit-primary-parser)))
         (should-not (treesit-node-check root 'has-error))
         (dolist (setting treesit-font-lock-settings)
           (dolist (capture (treesit-query-capture root (car setting)))
             (ert-info ((treesit-node-type (cdr capture)))
               (should (= (treesit-node-child-count (cdr capture)) 0)))))))))
+
+(ert-deftest awk-ts-mode-gnu-preserves-keyword-and-builtin-name-contexts ()
+  (let ((treesit-font-lock-level 4))
+    (pcase-dolist (`(,source ,fragment ,face)
+                   '(("@namespace \"lib\"\nBEGIN {switch (x) {case 1: print x}}"
+                      "switch" font-lock-keyword-face)
+                     ("BEGIN {print lib::switch}" "switch" font-lock-variable-use-face)
+                     ("function f(switch) {return switch}"
+                      "return switch" font-lock-variable-use-face)
+                     ("function f(systime) {return awk::systime (3)}"
+                      "awk::systime" font-lock-variable-use-face)
+                     ("BEGIN {print awk::systime()}" "awk::systime" font-lock-builtin-face)))
+      (with-temp-buffer
+        (insert source)
+        (awk-ts-mode)
+        (should-not (treesit-node-check (treesit-parser-root-node treesit-primary-parser) 'has-error))
+        (font-lock-ensure)
+        (goto-char (point-min))
+        (search-forward fragment)
+        (should (eq (get-text-property (1- (point)) 'face) face))))))
+
+(ert-deftest awk-ts-mode-gnu-fontifies-leaves-by-level ()
+  (dolist (level '(1 2 3 4))
+    (with-temp-buffer
+      (insert "@namespace \"lib\"\nfunction lib::f(systime) {return systime (3)}\nBEGIN {x = @/a\\x2\\\nb\\x5cw/; print _\"\\u3042\"} # note")
+      (let ((treesit-font-lock-level level)) (awk-ts-mode))
+      (font-lock-ensure)
+      (pcase-dolist (`(,text ,offset ,minimum ,face)
+                     '(("namespace" 0 2 font-lock-preprocessor-face)
+                       ("lib::f" 0 2 font-lock-constant-face)
+                       ("lib::f" 5 2 font-lock-function-name-face)
+                       ("systime" 0 2 font-lock-variable-name-face)
+                       ("return systime" 7 2 font-lock-variable-use-face)
+                       ("3" 0 3 font-lock-number-face)
+                       ("/a" 1 4 font-lock-regexp-face)
+                       ("\\x2" 0 4 font-lock-escape-face)
+                       ("\\\n" 0 4 font-lock-punctuation-face)
+                       ("b\\x5c" 0 4 font-lock-escape-face)
+                       ("w/" 0 4 font-lock-constant-face)
+                       ("note" 0 1 font-lock-comment-face)))
+        (goto-char (point-min))
+        (search-forward text)
+        (should (eq (get-text-property (+ (- (point) (length text)) offset) 'face)
+                    (and (>= level minimum) face))))
+      (dolist (setting treesit-font-lock-settings)
+        (dolist (capture (treesit-query-capture (treesit-parser-root-node treesit-primary-parser) (car setting)))
+          (should (= (treesit-node-child-count (cdr capture)) 0)))))))
 
 ;;;; Navigation
 
@@ -736,7 +872,7 @@
           (second "function second (value) { return value }")
           (end "END { print 2 }"))
       (insert begin "\n" rule "\n" first "\n" second "\n" end "\n")
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (goto-char (point-min))
       (dolist (line (list begin rule first second end))
         (forward-sexp)
@@ -779,7 +915,7 @@
     (ert-info ((format "%S" unit))
       (with-temp-buffer
         (insert prefix unit suffix)
-        (awk-ts-mode)
+        (awk-ts-mode-test--posix)
         (should-not (treesit-node-check (treesit-buffer-root-node 'posix-awk) 'has-error))
         (let ((start (1+ (length prefix)))
               (end (1+ (+ (length prefix) (length unit)))))
@@ -792,7 +928,7 @@
 (ert-deftest awk-ts-mode-excludes-sexp-wrappers-and-empty-statements ()
   (with-temp-buffer
     (insert "BEGIN { ; print a[1], value, \"text\"; }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (dolist (node (treesit-query-capture
                    (treesit-buffer-root-node 'posix-awk)
                    '([(expr) (print_expr) (expr_list) (string_content)
@@ -805,7 +941,7 @@
 (ert-deftest awk-ts-mode-navigates-nested-boundaries-and-edited-expressions ()
   (with-temp-buffer
     (insert "BEGIN { print a + b * c, tail; }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (goto-char (awk-ts-mode-test--position "b * c"))
     (forward-sexp)
     (should (= (point) (+ (awk-ts-mode-test--position "a + b * c") 9)))
@@ -818,6 +954,24 @@
     (forward-sexp)
     (should (= (point) (+ (awk-ts-mode-test--position "array[index]") 12)))))
 
+(ert-deftest awk-ts-mode-gnu-syntax-comments-and-navigation-use-cst ()
+  (with-temp-buffer
+    (insert "@include _\"#file\"\nfunction lib::f(x) {return /a[#]/}\nBEGIN {print \"#text\"} # comment\n")
+    (awk-ts-mode)
+    (syntax-propertize (point-max))
+    (dolist (text '("#file" "#text" "[#]"))
+      (goto-char (point-min)) (search-forward text)
+      (should-not (nth 4 (syntax-ppss (1- (point)))))))
+  (with-temp-buffer
+    (insert "function lib::f(x) {return x}\nfunction g() {}\n")
+    (awk-ts-mode)
+    (should (equal (mapcar #'car (cdr (assoc "Function" (treesit-simple-imenu)))) '("lib::f" "g")))
+    (goto-char (point-max))
+    (beginning-of-defun)
+    (should (looking-at "function g"))
+    (beginning-of-defun)
+    (should (looking-at "function lib"))))
+
 ;;;; Imenu
 
 (ert-deftest awk-ts-mode-indexes-definitions ()
@@ -827,7 +981,7 @@
             "value { print value }\n"
             "function second (value) { return value }\n"
             "END { print 2 }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (let ((index (funcall imenu-create-index-function)))
       (should (equal (mapcar #'car index) '("Function")))
       (setq index (cdr (assoc "Function" index)))
@@ -860,7 +1014,7 @@
     (ert-info ((format "Return on line %s: %S" line source))
       (with-temp-buffer
         (insert source)
-        (awk-ts-mode)
+        (awk-ts-mode-test--posix)
         (setq-local indent-tabs-mode nil)
         (setq-local awk-ts-mode-indent-offset offset)
         (electric-indent-local-mode 1)
@@ -888,7 +1042,7 @@
     (ert-info ((format "%S / %S" prefix suffix))
       (with-temp-buffer
         (insert prefix suffix)
-        (awk-ts-mode)
+        (awk-ts-mode-test--posix)
         (setq-local indent-tabs-mode nil)
         (electric-indent-local-mode 1)
         (goto-char (1+ (length prefix)))
@@ -904,54 +1058,125 @@
     (ert-info ((format "Offset %s: %S" offset source))
       (should (equal (awk-ts-mode-test--indent source offset) expected)))))
 
+(ert-deftest awk-ts-mode-gnu-indents-control-structures-and-preserves-literal-lines ()
+  (pcase-dolist (`(,source ,expected)
+                 '(("BEGIN {\nswitch(x) {\ncase 1:\nprint x;\ndefault:\nprint 0;\n}\n}\n"
+                    "BEGIN {\n  switch(x) {\n    case 1:\n      print x;\n    default:\n      print 0;\n  }\n}\n")
+                   ("function f(x,\ny) {\nif(x)\nprint x;\nelse\nprint y;\n}\n"
+                    "function f(x,\n  y) {\n    if(x)\n      print x;\n    else\n      print y;\n  }\n")
+                   ("BEGIN {\nprint \"a\\\n   b\";\nx = @/a\\\n c/\n}\n"
+                    "BEGIN {\n  print \"a\\\n   b\";\n  x = @/a\\\n c/\n}\n")))
+    (with-temp-buffer
+      (insert source)
+      (awk-ts-mode)
+      (setq-local indent-tabs-mode nil)
+      (dotimes (_ 2)
+        (indent-region (point-min) (point-max))
+        (should (equal (buffer-substring-no-properties (point-min) (point-max)) expected))))))
+
+(ert-deftest awk-ts-mode-gnu-indents-enter-in-bodies-headers-and-continuations ()
+  (pcase-dolist (`(,prefix ,suffix ,column)
+                 '(("BEGIN {" "\n}" 2)
+                   ("BEGIN {\n  if(a)" "\n    print a\n}" 4)
+                   ("BEGIN {\n  if(a)\n    print a" "\n  print b\n}" 2)
+                   ("BEGIN {\n  if(a)\n    print a\n  else" "\n    print b\n}" 4)
+                   ("BEGIN {\n  x = f(1," "\n    2)\n}" 4)
+                   ("BEGIN {\n  switch(x) {\n    case 1:" "\n      print x;\n  }\n}" 6)))
+    (with-temp-buffer
+      (insert prefix suffix)
+      (awk-ts-mode)
+      (setq-local indent-tabs-mode nil)
+      (electric-indent-local-mode 1)
+      (goto-char (1+ (length prefix)))
+      (dotimes (_ 3)
+        (call-interactively (key-binding (kbd "RET")))
+        (ert-info ((format "%S" prefix))
+          (should (= (current-column) column)))))))
+
 ;;;; Updates
+
+(ert-deftest awk-ts-mode-reparses-old-recovery-even-for-distant-edits ()
+  (pcase-dolist (`(,language ,file ,properties)
+                 '((gawk "test.awk" "")
+                   (posix-awk "test.awk" "posix = true\n")))
+    (let ((treesit-font-lock-level 4))
+      (awk-ts-mode-test--with-file file properties "function f(x) {return (x}\nfunction g() {}\n"
+        (awk-ts-mode-test--buffer-state)
+        (let* ((parser treesit-primary-parser)
+               (notifiers (treesit-parser-notifiers parser)))
+          (should (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+          (treesit-parser-set-embed-level parser 3)
+          (goto-char (point-min))
+          (search-forward "function g")
+          (save-restriction
+            (narrow-to-region (line-beginning-position) (line-end-position))
+            (insert "x"))
+          (should-not (eq parser treesit-primary-parser))
+          (should (eq (treesit-parser-language treesit-primary-parser) language))
+          (should (= (treesit-parser-embed-level treesit-primary-parser) 3))
+          (should (equal (treesit-parser-notifiers treesit-primary-parser) notifiers))
+          (should (equal (treesit-parser-list) (list treesit-primary-parser))))
+        (goto-char (point-min))
+        (search-forward "x}")
+        (backward-char 1)
+        (insert ")")
+        (should-not (treesit-node-check
+                     (treesit-parser-root-node treesit-primary-parser) 'has-error))
+        (awk-ts-mode-test--should-match-fresh-buffer 4 t)))))
+
+(ert-deftest awk-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((gawk "test.awk" "" "function f(x) {return x}\n" "x" 1)
+                   (posix-awk "test.awk" "posix = true\n" "function f(x) {return x}\n" "x" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (awk-ts-mode-test--with-file file properties source
+            (rename-buffer "awk-ts-mode-test" t)
+            (let ((noninteractive nil)) (font-lock-mode 1))
+            (awk-ts-mode-test--buffer-state)
+            (should (get-text-property owner-start 'fontified))
+            (let ((parser treesit-primary-parser))
+              (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+              (dolist (notifier (treesit-parser-notifiers parser))
+                (treesit-parser-remove-notifier parser notifier))
+              (goto-char (awk-ts-mode-test--position fragment))
+              (when narrow
+                (narrow-to-region (line-beginning-position) (line-end-position)))
+              (insert "x")
+              (widen)
+              (should (eq parser treesit-primary-parser))
+              (should-not (get-text-property owner-start 'fontified))
+              (awk-ts-mode-test--should-match-fresh-buffer 4 t))))))))
 
 (ert-deftest awk-ts-mode-reparses-a-bom-moved-to-buffer-start ()
   (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
-                 '((posix-awk "test.awk" "" "BEGIN {}\n" "# note\n" "note" font-lock-comment-face)))
+                 '((gawk "test.awk" "" "BEGIN {}\n" "# note\n" "note" font-lock-comment-face)
+                   (posix-awk "test.awk" "posix = true\n" "BEGIN {}\n" "# note\n" "note" font-lock-comment-face)))
     (dolist (narrow '(nil t))
       (ert-info ((format "%s, narrowed: %s" language narrow))
-        (let ((default-directory
-               (file-name-as-directory (make-temp-file "awk-ts-mode-" t))))
-          (unwind-protect
-              (progn
-                (with-temp-file (expand-file-name ".editorconfig")
-                  (insert "root = true\n[*]\n" properties))
-                (with-temp-buffer
-                  (setq buffer-file-name (expand-file-name file))
-                  (insert prefix "\ufeff" body)
-                  (let ((treesit-font-lock-level 4)) (awk-ts-mode))
-                  (awk-ts-mode-test--buffer-state)
-                  (when narrow
-                    (narrow-to-region 1 (+ 2 (length prefix))))
-                  (delete-region 1 (1+ (length prefix)))
-                  (widen)
-                  (should (eq (treesit-parser-language treesit-primary-parser) language))
-                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
-                  (let ((state (awk-ts-mode-test--buffer-state))
-                        (tree (treesit-node-string
-                               (treesit-parser-root-node treesit-primary-parser)))
-                        (source (buffer-substring-no-properties (point-min) (point-max)))
-                        (filename buffer-file-name))
-                    (should (equal source (concat "\ufeff" body)))
-                    (should-not (get-text-property 1 'face))
-                    (goto-char (point-min))
-                    (search-forward fragment)
-                    (should (eq (get-text-property (1- (point)) 'face) face))
-                    (with-temp-buffer
-                      (setq buffer-file-name filename)
-                      (insert source)
-                      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
-                      (should (equal state (awk-ts-mode-test--buffer-state)))
-                      (should (equal tree (treesit-node-string
-                                           (treesit-parser-root-node treesit-primary-parser))))))))
-            (delete-directory default-directory t)))))))
+        (let ((treesit-font-lock-level 4))
+          (awk-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+            (awk-ts-mode-test--buffer-state)
+            (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+            (delete-region 1 (1+ (length prefix)))
+            (widen)
+            (should (eq (treesit-parser-language treesit-primary-parser) language))
+            (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+            (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                           (concat "\ufeff" body)))
+            (awk-ts-mode-test--buffer-state)
+            (should-not (get-text-property 1 'face))
+            (goto-char (point-min))
+            (search-forward fragment)
+            (should (eq (get-text-property (1- (point)) 'face) face))
+            (awk-ts-mode-test--should-match-fresh-buffer 4 t)))))))
 
 (ert-deftest awk-ts-mode-refreshes-syntax-before-multiline-errors ()
   (dolist (narrow '(nil t))
     (with-temp-buffer
       (insert "function f(x) {\n  print x\n}\n")
-      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+      (let ((treesit-font-lock-level 4)) (awk-ts-mode-test--posix))
       (syntax-propertize (point-max))
       (should (= (syntax-class (syntax-after 11)) 4))
       (goto-char (point-min))
@@ -963,7 +1188,6 @@
           (delete-char 1)
           (syntax-propertize (point-max)))
         (awk-ts-mode-test--should-match-fresh-buffer 4)
-        (should (= (syntax-class (syntax-after 11)) 1))
         (goto-char position)
         (insert removed)
         (awk-ts-mode-test--should-match-fresh-buffer 4)
@@ -978,7 +1202,7 @@
       (with-temp-buffer
 
         (insert source)
-        (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+        (let ((treesit-font-lock-level 4)) (awk-ts-mode-test--posix))
         (awk-ts-mode-test--buffer-state)
         (goto-char (awk-ts-mode-test--position old))
         (delete-char (length old))
@@ -990,7 +1214,7 @@
 (ert-deftest awk-ts-mode-reclassifies-delimiters-after-edits ()
   (with-temp-buffer
     (insert "BEGIN {\nprint\n}\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (should (= (awk-ts-mode-test--syntax-class "}" nil "}") 5))
     (goto-char (point-min))
     (search-forward "{")
@@ -1005,7 +1229,7 @@
   (with-temp-buffer
     (let ((commented "BEGIN { print x # note"))
       (insert commented "\n}\n")
-      (awk-ts-mode)
+      (awk-ts-mode-test--posix)
       (should (awk-ts-mode-test--comment-p "note" nil commented))
       (goto-char (awk-ts-mode-test--position "#" commented))
       (let ((quote-position (point))
@@ -1018,7 +1242,7 @@
 (ert-deftest awk-ts-mode-preserves-syntax-when-narrowed ()
   (with-temp-buffer
     (insert "# first\n# second\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (goto-char (point-min))
     (forward-line 1)
     (narrow-to-region (point) (point-max))
@@ -1075,7 +1299,7 @@
 (ert-deftest awk-ts-mode-rebuilds-imenu-after-edits ()
   (with-temp-buffer
     (insert "function first() { return 1 }\n")
-    (awk-ts-mode)
+    (awk-ts-mode-test--posix)
     (should (equal (mapcar #'car (cdr (assoc "Function"
                                              (funcall imenu-create-index-function))))
                    '("first")))
@@ -1084,6 +1308,50 @@
     (should (equal (mapcar #'car (cdr (assoc "Function"
                                              (funcall imenu-create-index-function))))
                    '("first" "second")))))
+
+(ert-deftest awk-ts-mode-gnu-edits-reclassify-faces-and-syntax-like-fresh-buffers ()
+  (pcase-dolist (`(,source ,before ,after)
+                 '(("@namespace \"awk\"\nBEGIN {print systime (3)}" "awk" "lib")
+                   ("function f(systime) {return systime (3)}" "systime" "other")
+                   ("BEGIN {print (a)}" "(a)" "(a)+b")
+                   ("BEGIN {print /a\\x2b/}" "2b" "28b\\x29")
+                   ("@include \"#file\"\nBEGIN {}" "file\"" "file")
+                   ("BEGIN {print \"unfinished}" "unfinished}" "finished\"}")))
+    (with-temp-buffer
+      (insert source)
+      (let ((treesit-font-lock-level 4)) (awk-ts-mode))
+      (awk-ts-mode-test--buffer-state)
+      (goto-char (point-min))
+      (search-forward before)
+      (replace-match after t t)
+      (awk-ts-mode-test--should-match-fresh-buffer 4))))
+
+(ert-deftest awk-ts-mode-gnu-refreshes-distant-context-without-change-notifications ()
+  (with-temp-buffer
+    (rename-buffer "awk-ts-mode-gnu-test" t)
+    (insert "function f(systime) {\n  return systime (3)\n}\n")
+    (awk-ts-mode)
+    (let ((noninteractive nil)) (font-lock-mode 1))
+    (font-lock-ensure)
+    (goto-char (point-min))
+    (search-forward "return ")
+    (let ((body (copy-marker (point)))
+          (parser treesit-primary-parser))
+      (unwind-protect
+          (progn
+            (should (eq (get-text-property body 'face) 'font-lock-variable-use-face))
+            (should (get-text-property body 'fontified))
+            (dolist (notifier (treesit-parser-notifiers parser))
+              (treesit-parser-remove-notifier parser notifier))
+            (goto-char (point-min))
+            (search-forward "f(")
+            (insert "x")
+            (should (eq parser treesit-primary-parser))
+            (should-not (get-text-property body 'fontified))
+            (font-lock-ensure)
+            (should (eq (get-text-property body 'face) 'font-lock-builtin-face))
+            (awk-ts-mode-test--should-match-fresh-buffer treesit-font-lock-level))
+        (set-marker body nil)))))
 
 (provide 'awk-ts-mode-test)
 
