@@ -46,9 +46,9 @@
 
 (defconst awk-ts-mode--grammar-sources
   '((gawk "https://github.com/konomanoasa/tree-sitter-gawk"
-          :revision "v0.2.0")
+          :revision "v0.2.1")
     (posix-awk "https://github.com/konomanoasa/tree-sitter-posix-awk"
-               :revision "v0.20.0"))
+               :revision "v0.20.1"))
   "Tree-sitter grammar sources for GNU and POSIX awk.")
 
 (defun awk-ts-mode--language ()
